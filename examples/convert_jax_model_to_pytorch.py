@@ -393,6 +393,80 @@ def slice_gemma_state_dict(state_dict, config, *, num_expert, checkpoint_dir, pi
     return final_state_dict
 
 
+def slice_progress_head_state_dict(state_dict):
+    """Convert ProgressHead JAX parameters to PyTorch format."""
+    if state_dict is None or len(state_dict) == 0:
+        return {}
+    
+    pytorch_state_dict = {}
+    state_dict = dict(state_dict)
+    
+    # 1. Attention pooling
+    if "attention_pool/query" in state_dict:
+        query = state_dict.pop("attention_pool/query")
+        # Keep shape as [1, embed_dim] to match PyTorch model
+        pytorch_state_dict["progress_head.attention_pool.query"] = torch.from_numpy(np.array(query))
+    
+    if "attention_pool/key_proj/kernel" in state_dict:
+        pytorch_state_dict["progress_head.attention_pool.key_proj.weight"] = torch.from_numpy(
+            np.array(state_dict.pop("attention_pool/key_proj/kernel")).T
+        )
+    # Note: key_proj and value_proj do not have bias (use_bias=False)
+    
+    if "attention_pool/value_proj/kernel" in state_dict:
+        pytorch_state_dict["progress_head.attention_pool.value_proj.weight"] = torch.from_numpy(
+            np.array(state_dict.pop("attention_pool/value_proj/kernel")).T
+        )
+    
+    # 2. Input projection
+    if "input_proj/kernel" in state_dict:
+        pytorch_state_dict["progress_head.input_proj.weight"] = torch.from_numpy(
+            np.array(state_dict.pop("input_proj/kernel")).T
+        )
+    if "input_proj/bias" in state_dict:
+        pytorch_state_dict["progress_head.input_proj.bias"] = torch.from_numpy(np.array(state_dict.pop("input_proj/bias")))
+    
+    # 3. Input LayerNorm
+    if "input_norm/scale" in state_dict:
+        pytorch_state_dict["progress_head.input_norm.weight"] = torch.from_numpy(np.array(state_dict.pop("input_norm/scale")))
+    if "input_norm/bias" in state_dict:
+        pytorch_state_dict["progress_head.input_norm.bias"] = torch.from_numpy(np.array(state_dict.pop("input_norm/bias")))
+    
+    # 4. MLP blocks
+    block_keys = set()
+    for key in list(state_dict.keys()):
+        if key.startswith("mlp_blocks/"):
+            block_keys.add(key.split("/")[1])
+    
+    for block_name in sorted(block_keys):
+        if f"mlp_blocks/{block_name}/fc/kernel" in state_dict:
+            pytorch_state_dict[f"progress_head.mlp_blocks.{block_name}.fc.weight"] = torch.from_numpy(
+                np.array(state_dict.pop(f"mlp_blocks/{block_name}/fc/kernel")).T
+            )
+        if f"mlp_blocks/{block_name}/fc/bias" in state_dict:
+            pytorch_state_dict[f"progress_head.mlp_blocks.{block_name}.fc.bias"] = torch.from_numpy(
+                np.array(state_dict.pop(f"mlp_blocks/{block_name}/fc/bias"))
+            )
+        if f"mlp_blocks/{block_name}/norm/scale" in state_dict:
+            pytorch_state_dict[f"progress_head.mlp_blocks.{block_name}.norm.weight"] = torch.from_numpy(
+                np.array(state_dict.pop(f"mlp_blocks/{block_name}/norm/scale"))
+            )
+        if f"mlp_blocks/{block_name}/norm/bias" in state_dict:
+            pytorch_state_dict[f"progress_head.mlp_blocks.{block_name}.norm.bias"] = torch.from_numpy(
+                np.array(state_dict.pop(f"mlp_blocks/{block_name}/norm/bias"))
+            )
+    
+    # 5. Output projection
+    if "output_proj/kernel" in state_dict:
+        pytorch_state_dict["progress_head.output_proj.weight"] = torch.from_numpy(
+            np.array(state_dict.pop("output_proj/kernel")).T
+        )
+    if "output_proj/bias" in state_dict:
+        pytorch_state_dict["progress_head.output_proj.bias"] = torch.from_numpy(np.array(state_dict.pop("output_proj/bias")))
+    
+    return pytorch_state_dict
+
+
 def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str | None = None):
     """Load and process params by restoring via JAX model loader first.
     This respects dtype conversions that occur during model restore.
@@ -402,7 +476,15 @@ def slice_initial_orbax_checkpoint(checkpoint_dir: str, restore_precision: str |
         f"{checkpoint_dir}/params/", restore_type=np.ndarray, dtype=restore_precision
     )
 
-    return {"paligemma_params": traversals.flatten_mapping(params["PaliGemma"], sep="/"), "projection_params": params}
+    progress_head_params = None
+    if "progress_head" in params:
+        progress_head_params = traversals.flatten_mapping(params["progress_head"], sep="/")
+
+    return {
+        "paligemma_params": traversals.flatten_mapping(params["PaliGemma"], sep="/"),
+        "projection_params": params,
+        "progress_head_params": progress_head_params,
+    }
 
 
 def load_jax_model_and_print_keys(checkpoint_dir: str):
@@ -510,11 +592,17 @@ def convert_pi0_checkpoint(
         expert_params, action_expert_config, num_expert=1, checkpoint_dir=checkpoint_dir, pi05=model_config.pi05
     )
 
+    # Process progress_head weights if they exist
+    progress_head_params = {}
+    if initial_params["progress_head_params"] is not None:
+        progress_head_params = slice_progress_head_state_dict(initial_params["progress_head_params"])
+        print(f"Converted {len(progress_head_params)} progress_head parameters")
+
     # Instantiate model
     pi0_model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_config)
 
     # Combine all parameters (no prefix needed for our model structure)
-    all_params = {**paligemma_params, **gemma_params, **projection_params}
+    all_params = {**paligemma_params, **gemma_params, **projection_params, **progress_head_params}
 
     # Load state dict
     pi0_model.load_state_dict(all_params, strict=False)
