@@ -103,12 +103,13 @@ class Policy(BasePolicy):
                         progress_tensor = self._model.estimate_progress(observation)
                         progress = float(progress_tensor[0].detach().cpu().numpy())
                 else:
-                    # JAX model
-                    progress_fn = nnx_utils.module_jit(self._model.estimate_progress)
-                    progress_array = progress_fn(observation)
+                    # JAX model - use the jitted function
+                    if not hasattr(self, '_estimate_progress_fn'):
+                        self._estimate_progress_fn = nnx_utils.module_jit(self._model.estimate_progress)
+                    progress_array = self._estimate_progress_fn(observation)
                     progress = float(progress_array[0])
             except Exception as e:
-                logging.warning(f"Failed to estimate progress: {e}")
+                logging.warning(f"Failed to estimate progress: {e}", exc_info=True)
                 progress = None
         
         outputs = {

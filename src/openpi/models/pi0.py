@@ -99,12 +99,15 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        # Progress estimation head (uses VLM features from paligemma)
-        self.progress_head = nnx.Sequential(
-            nnx.Linear(paligemma_config.width, 256, rngs=rngs),
-            lambda x: nnx.swish(x),
-            nnx.Linear(256, 1, rngs=rngs),
-            lambda x: nnx.sigmoid(x),  # Output in range [0, 1]
+        # Progress estimation head with improved architecture
+        from openpi.models import progress_head as _progress_head
+        self.progress_head = _progress_head.ProgressHead(
+            input_dim=paligemma_config.width,  # 2048 for PaliGemma
+            num_bins=101,  # 0%, 1%, ..., 100%
+            hidden_dim=512,  # Match checkpoint configuration
+            num_layers=3,
+            pool_dim=2048,  # No dimension reduction in attention pooling
+            rngs=rngs,
         )
 
         # This attribute gets automatically set by model.train() and model.eval().
@@ -348,7 +351,9 @@ class Pi0(_model.BaseModel):
 
     @at.typecheck
     def estimate_progress(self, obs: _model.Observation) -> at.Float[at.Array, " b"]:
-        """Estimate task completion progress from observations.
+        """Estimate task completion progress using improved architecture.
+        
+        Uses attention pooling, multi-layer MLP, and soft-argmax over bins.
         
         Args:
             obs: Observation containing images and other inputs
@@ -359,14 +364,23 @@ class Pi0(_model.BaseModel):
         # Embed the prefix (images + language)
         prefix_tokens, prefix_mask, _ = self.embed_prefix(obs)
         
-        # Pool the VLM features using masked average
-        # This gives us a single representation per batch element
-        mask_expanded = prefix_mask[:, :, None]  # [b, s, 1]
-        masked_tokens = prefix_tokens * mask_expanded  # [b, s, emb]
-        sum_tokens = jnp.sum(masked_tokens, axis=1)  # [b, emb]
-        count = jnp.sum(mask_expanded, axis=1)  # [b, 1]
-        pooled = sum_tokens / jnp.maximum(count, 1.0)  # [b, emb]
+        # Use improved progress head with attention pooling and binning
+        progress, _ = self.progress_head(prefix_tokens, prefix_mask)  # [b]
         
-        # Pass through progress head
-        progress = self.progress_head(pooled)  # [b, 1]
-        return jnp.squeeze(progress, axis=-1)  # [b]
+        return progress
+    
+    @at.typecheck
+    def estimate_progress_with_logits(
+        self, obs: _model.Observation
+    ) -> tuple[at.Float[at.Array, " b"], at.Float[at.Array, "b {self.progress_head.num_bins}"]]:
+        """Estimate progress and return bin logits for loss computation.
+        
+        Args:
+            obs: Observation containing images and other inputs
+            
+        Returns:
+            progress: [batch] progress values in [0, 1]
+            logits: [batch, num_bins] bin logits for cross-entropy loss
+        """
+        prefix_tokens, prefix_mask, _ = self.embed_prefix(obs)
+        return self.progress_head(prefix_tokens, prefix_mask)

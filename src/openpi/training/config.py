@@ -377,7 +377,7 @@ class LeRobotTeleavatarDataConfig(DataConfigFactory):
                         "observation/images/right_color": "observation.images.right_color",
                         "observation/images/head_camera": "observation.images.chest_camera",  # use chest_camera data
                         "observation/state": "observation.state",
-                        "observation.progress": "observation.progress",  # Add progress field for training
+                        "observation/progress": "observation.progress",  # Add progress field for training (target uses /, source uses .)
                         "action": "action",  # Keep action as action
                     }
                 )
@@ -609,7 +609,7 @@ class TrainConfig:
     # Random seed that will be used by random generators during training.
     seed: int = 42
     # Global batch size.
-    batch_size: int = 32
+    batch_size: int = 128
     # Number of workers to use for the data loader. Increasing this number will speed up data loading but
     # will increase memory and CPU usage.
     num_workers: int = 32
@@ -879,14 +879,16 @@ _CONFIGS = [
             action_dim=32  # Teleavatar uses 16-dim actions
         ),
         data=LeRobotTeleavatarDataConfig(
-            repo_id="/media/caslx/1635-A2D7/Data/putplates_20251117_with_progress",  # Your local dataset name
+            repo_id="/home/caslx/Robotics/openpi/checkpoints/pi05_RL_putplates/assets/inference",  # Dataset with progress labels
             base_config=DataConfig(
-                prompt_from_task=True,  # No prompts in teleavatar dataset
+                prompt_from_task=True,  # Use task from dataset as prompt
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
             use_delta_joint_actions=False,
         ),
         batch_size=64,
+        num_workers=32,
+        fsdp_devices=8,  # Enable FSDP: shard model across 8 GPUs to reduce memory per GPU
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=5_000,
             peak_lr=5e-5,

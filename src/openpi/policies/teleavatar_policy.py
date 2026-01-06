@@ -110,6 +110,16 @@ class TeleavatarInputs(transforms.DataTransformFn):
         else:
             inputs["prompt"] = "pick a toy and put it in the basket using left gripper"  # Default task for teleavatar
 
+        # Pass progress field if available (for training progress estimation head)
+        # Note: After RepackTransform, key uses "/" not "."
+        progress_key = "observation/progress" if "observation/progress" in data else "observation.progress"
+        if progress_key in data:
+            progress_val = data[progress_key]
+            # Squeeze if needed: (1,) -> scalar or keep as is for batch
+            if hasattr(progress_val, 'squeeze'):
+                progress_val = progress_val.squeeze()
+            inputs["progress"] = progress_val
+
         return inputs
 
 
@@ -127,7 +137,13 @@ class TeleavatarOutputs(transforms.DataTransformFn):
     """
 
     def __call__(self, data: dict) -> dict:
-        # Only return the first 16 actions for teleavatar.
+        # Extract the first 16 actions for teleavatar.
         # Since the model may output more dimensions due to padding, we extract just what we need.
         # For your own dataset, replace `16` with the action dimension of your dataset.
-        return {"actions": np.asarray(data["actions"][:, :16])}
+        result = {"actions": np.asarray(data["actions"][:, :16])}
+        
+        # Pass through progress if present (for progress estimation feature)
+        if "progress" in data:
+            result["progress"] = data["progress"]
+        
+        return result

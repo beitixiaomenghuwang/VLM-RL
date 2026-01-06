@@ -124,14 +124,19 @@ def add_progress_labels_fast(input_path: str, output_path: str, overwrite: bool 
     if not data_files:
         raise FileNotFoundError(f"在 {data_dir} 中未找到数据文件")
     
-    # 计算全局帧到 episode 的映射
+    # 计算全局帧到 episode 的映射（离散化为 0-100 的整数百分比）
     frame_to_episode = {}
     global_idx = 0
     for ep_idx, episode in enumerate(episodes_metadata):
         ep_length = episode["length"]
         for frame_idx in range(ep_length):
-            progress = frame_idx / max(1, ep_length - 1)
-            frame_to_episode[global_idx] = progress
+            # 连续进度值
+            continuous_progress = frame_idx / max(1, ep_length - 1)
+            # 离散化为 0-100 的整数百分比，然后归一化到 [0, 1]
+            discrete_percent = int(round(continuous_progress * 100))
+            discrete_percent = min(100, max(0, discrete_percent))  # 确保在 [0, 100]
+            discrete_progress = discrete_percent / 100.0  # 转回 [0, 1] 范围
+            frame_to_episode[global_idx] = discrete_progress
             global_idx += 1
     
     # 处理每个数据文件

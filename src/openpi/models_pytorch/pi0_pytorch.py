@@ -9,6 +9,7 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
+from openpi.models_pytorch.progress_head_pytorch import ProgressHead
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -107,6 +108,15 @@ class PI0Pytorch(nn.Module):
             self.state_proj = nn.Linear(32, action_expert_config.width)
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
+
+        # Progress estimation head
+        self.progress_head = ProgressHead(
+            input_dim=paligemma_config.width,  # 2048 for PaliGemma
+            num_bins=101,  # 0%, 1%, ..., 100%
+            hidden_dim=512,  # Match JAX checkpoint configuration
+            num_layers=3,
+            pool_dim=2048,  # No dimension reduction in attention pooling
+        )
 
         torch.set_float32_matmul_precision("high")
         self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
@@ -459,3 +469,49 @@ class PI0Pytorch(nn.Module):
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         return self.action_out_proj(suffix_out)
+
+    @torch.no_grad()
+    def estimate_progress(self, observation) -> torch.Tensor:
+        """Estimate task completion progress using improved architecture.
+        
+        Uses attention pooling, multi-layer MLP, and soft-argmax over bins.
+        
+        Args:
+            observation: Observation containing images and other inputs
+            
+        Returns:
+            Progress values in range [0, 1] for each batch element [batch]
+        """
+        images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
+        
+        # Embed the prefix (images + language)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        
+        # Convert to float32 for progress head computation
+        prefix_embs = prefix_embs.to(dtype=torch.float32)
+        
+        # Use improved progress head with attention pooling and binning
+        progress, _ = self.progress_head(prefix_embs, prefix_pad_masks)  # [b]
+        
+        return progress
+    
+    @torch.no_grad()
+    def estimate_progress_with_logits(self, observation) -> tuple[torch.Tensor, torch.Tensor]:
+        """Estimate progress and return bin logits for loss computation.
+        
+        Args:
+            observation: Observation containing images and other inputs
+            
+        Returns:
+            progress: [batch] progress values in [0, 1]
+            logits: [batch, num_bins] bin logits for cross-entropy loss
+        """
+        images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
+        
+        # Embed the prefix (images + language)
+        prefix_embs, prefix_pad_masks, _ = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
+        
+        # Convert to float32 for progress head computation
+        prefix_embs = prefix_embs.to(dtype=torch.float32)
+        
+        return self.progress_head(prefix_embs, prefix_pad_masks)

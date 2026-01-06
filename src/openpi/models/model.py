@@ -240,6 +240,21 @@ class BaseModelConfig(abc.ABC):
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+        
+        # Handle missing bias parameters for progress_head (from use_bias=False in checkpoint)
+        # NNX Linear layers create bias entries even with use_bias=False, but checkpoint may not have them
+        state_dict = state.to_pure_dict()
+        if 'progress_head' in state_dict and 'progress_head' in params:
+            flat_state = traverse_util.flatten_dict(state_dict['progress_head'])
+            flat_params = traverse_util.flatten_dict(params['progress_head'])
+            
+            # Add None for missing bias parameters
+            for key in flat_state.keys():
+                if key[-1] == 'bias' and key not in flat_params:
+                    flat_params[key] = None
+            
+            params['progress_head'] = traverse_util.unflatten_dict(flat_params)
+        
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)

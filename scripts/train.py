@@ -147,22 +147,54 @@ def train_step(
     def loss_fn(
         model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
     ):
-        # Check if model has progress estimation capability
-        if hasattr(model, 'compute_loss_with_progress') and observation.progress is not None:
-            # Use multi-task loss with progress estimation
-            action_loss, progress_loss = model.compute_loss_with_progress(
-                rng, observation, actions, train=True
-            )
-            # Weighted combination: action loss weight = 1.0, progress loss weight = 0.1
-            total_loss = jnp.mean(action_loss) + 0.1 * jnp.mean(progress_loss)
-            return total_loss, {
-                "action_loss": jnp.mean(action_loss),
-                "progress_loss": jnp.mean(progress_loss),
-            }
-        else:
-            # Fall back to standard action-only loss
-            chunked_loss = model.compute_loss(rng, observation, actions, train=True)
-            return jnp.mean(chunked_loss), {}
+        # Always compute action loss
+        chunked_loss = model.compute_loss(rng, observation, actions, train=True)
+        action_loss = jnp.mean(chunked_loss)
+        
+        # Compute progress loss using KL divergence with Gaussian smoothed labels
+        progress_loss = jnp.array(0.0)
+        if hasattr(model, 'estimate_progress_with_logits') and observation.progress is not None:
+            # Get bin logits from progress head
+            _, logits = model.estimate_progress_with_logits(observation)  # [b, 101]
+            
+            # Convert progress to target bin indices
+            target_progress = jnp.squeeze(observation.progress) if observation.progress.ndim > 1 else observation.progress
+            target_bins = jnp.round(target_progress * 100).astype(jnp.int32)
+            target_bins = jnp.clip(target_bins, 0, 100)  # [b]
+            
+            # Create Gaussian smoothed target distribution
+            # Instead of hard one-hot, use soft labels with Gaussian smoothing
+            bin_indices = jnp.arange(101)  # [0, 1, 2, ..., 100]
+            sigma = 2.0  # Standard deviation for Gaussian (adjust for smoothness)
+            
+            # For each sample in batch, create Gaussian distribution centered at target_bin
+            # distances shape: [b, 101] - distance from each bin to target for each sample
+            distances = bin_indices[None, :] - target_bins[:, None]  # [b, 101]
+            
+            # Gaussian probabilities: P(i) = exp(-(i - target)^2 / 2σ^2)
+            gaussian_probs = jnp.exp(-(distances ** 2) / (2 * sigma ** 2))  # [b, 101]
+            
+            # Normalize to sum to 1 (proper probability distribution)
+            target_distribution = gaussian_probs / jnp.sum(gaussian_probs, axis=-1, keepdims=True)  # [b, 101]
+            
+            # KL divergence loss: KL(target || predicted)
+            # More memory-efficient: use log_softmax directly, avoid computing softmax separately
+            log_predicted = jax.nn.log_softmax(logits, axis=-1)  # [b, 101]
+            log_target = jnp.log(target_distribution + 1e-10)  # [b, 101]
+            
+            # KL(P || Q) = sum(P * (log(P) - log(Q)))
+            # Use stop_gradient on target to avoid unnecessary gradients
+            kl_div = jnp.sum(jax.lax.stop_gradient(target_distribution) * (log_target - log_predicted), axis=-1)  # [b]
+            progress_loss = jnp.mean(kl_div)
+        
+        # Total loss: balance action and progress (reduced weight to avoid OOM)
+        # Further reduce weight if OOM persists
+        total_loss = action_loss + 0.01 * progress_loss
+        
+        return total_loss, {
+            "action_loss": action_loss,
+            "progress_loss": progress_loss,
+        }
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
@@ -245,9 +277,11 @@ def main(config: _config.TrainConfig):
     logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
 
     # Log images from first batch to sanity check.
+    # Convert JAX arrays to numpy first to avoid triggering computation during indexing
+    batch_np = jax.device_get(batch)
     images_to_log = [
-        wandb.Image(np.concatenate([np.array(img[i]) for img in batch[0].images.values()], axis=1))
-        for i in range(min(5, len(next(iter(batch[0].images.values())))))
+        wandb.Image(np.concatenate([np.array(img[i]) for img in batch_np[0].images.values()], axis=1))
+        for i in range(min(5, len(next(iter(batch_np[0].images.values())))))
     ]
     wandb.log({"camera_views": images_to_log}, step=0)
 
