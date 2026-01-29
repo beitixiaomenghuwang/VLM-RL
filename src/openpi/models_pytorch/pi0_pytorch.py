@@ -109,10 +109,10 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # Progress estimation head
+        # Progress estimation head with binary classification
         self.progress_head = ProgressHead(
             input_dim=paligemma_config.width,  # 2048 for PaliGemma
-            num_bins=101,  # 0%, 1%, ..., 100%
+            num_bins=2,  # Binary classification: 0=incomplete, 1=complete
             hidden_dim=512,  # Match JAX checkpoint configuration
             num_layers=3,
             pool_dim=2048,  # No dimension reduction in attention pooling
@@ -472,15 +472,15 @@ class PI0Pytorch(nn.Module):
 
     @torch.no_grad()
     def estimate_progress(self, observation) -> torch.Tensor:
-        """Estimate task completion progress using improved architecture.
+        """Estimate task completion progress using binary classification.
         
-        Uses attention pooling, multi-layer MLP, and soft-argmax over bins.
+        Uses attention pooling and multi-layer MLP for classification.
         
         Args:
             observation: Observation containing images and other inputs
             
         Returns:
-            Progress values in range [0, 1] for each batch element [batch]
+            Progress values (0 or 1) for each batch element [batch]
         """
         images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
         
@@ -490,21 +490,21 @@ class PI0Pytorch(nn.Module):
         # Convert to float32 for progress head computation
         prefix_embs = prefix_embs.to(dtype=torch.float32)
         
-        # Use improved progress head with attention pooling and binning
-        progress, _ = self.progress_head(prefix_embs, prefix_pad_masks)  # [b]
+        # Use binary classification progress head
+        progress, _ = self.progress_head(prefix_embs, prefix_pad_masks)  # [b], rounded 0 or 1
         
         return progress
     
     @torch.no_grad()
     def estimate_progress_with_logits(self, observation) -> tuple[torch.Tensor, torch.Tensor]:
-        """Estimate progress and return bin logits for loss computation.
+        """Estimate progress and return class logits for loss computation.
         
         Args:
             observation: Observation containing images and other inputs
             
         Returns:
-            progress: [batch] progress values in [0, 1]
-            logits: [batch, num_bins] bin logits for cross-entropy loss
+            progress: [batch] progress values (0 or 1), rounded
+            logits: [batch, 2] class logits for binary cross-entropy loss
         """
         images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
         

@@ -5,8 +5,8 @@
 用法：
     conda activate lerobot
     python scripts/add_progress_labels.py \
-        --input_dataset /media/caslx/1635-A2D7/Data/putplates_20251117 \
-        --output_dataset /media/caslx/1635-A2D7/Data/putplates_20251117_with_progress
+        --input_dataset /media/caslx/1635-A2D7/Data/pick_marker_put_into_cup_20251113 \
+        --output_dataset /media/caslx/1635-A2D7/Data/pick_marker_put_into_cup_20251113_with_progress
 """
 
 import argparse
@@ -124,19 +124,20 @@ def add_progress_labels_fast(input_path: str, output_path: str, overwrite: bool 
     if not data_files:
         raise FileNotFoundError(f"在 {data_dir} 中未找到数据文件")
     
-    # 计算全局帧到 episode 的映射（离散化为 0-100 的整数百分比）
+    # 计算全局帧到 episode 的映射（前n-1秒为0，最后1秒为1）
     frame_to_episode = {}
     global_idx = 0
+    fps = 30  # 假设30fps，最后1秒 = 30帧
     for ep_idx, episode in enumerate(episodes_metadata):
         ep_length = episode["length"]
+        last_second_frames = min(fps, ep_length)  # 最后1秒的帧数
         for frame_idx in range(ep_length):
-            # 连续进度值
-            continuous_progress = frame_idx / max(1, ep_length - 1)
-            # 离散化为 0-100 的整数百分比，然后归一化到 [0, 1]
-            discrete_percent = int(round(continuous_progress * 100))
-            discrete_percent = min(100, max(0, discrete_percent))  # 确保在 [0, 100]
-            discrete_progress = discrete_percent / 100.0  # 转回 [0, 1] 范围
-            frame_to_episode[global_idx] = discrete_progress
+            # 前n-1秒为0，最后1秒为1
+            if frame_idx >= ep_length - last_second_frames:
+                progress = 1.0
+            else:
+                progress = 0.0
+            frame_to_episode[global_idx] = progress
             global_idx += 1
     
     # 处理每个数据文件

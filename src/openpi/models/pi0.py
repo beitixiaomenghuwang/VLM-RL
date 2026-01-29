@@ -99,11 +99,11 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        # Progress estimation head with improved architecture
+        # Progress estimation head with binary classification
         from openpi.models import progress_head as _progress_head
         self.progress_head = _progress_head.ProgressHead(
             input_dim=paligemma_config.width,  # 2048 for PaliGemma
-            num_bins=101,  # 0%, 1%, ..., 100%
+            num_bins=2,  # Binary classification: 0=incomplete, 1=complete
             hidden_dim=512,  # Match checkpoint configuration
             num_layers=3,
             pool_dim=2048,  # No dimension reduction in attention pooling
@@ -371,16 +371,24 @@ class Pi0(_model.BaseModel):
     
     @at.typecheck
     def estimate_progress_with_logits(
-        self, obs: _model.Observation
+        self, obs: _model.Observation, stop_gradient_backbone: bool = False
     ) -> tuple[at.Float[at.Array, " b"], at.Float[at.Array, "b {self.progress_head.num_bins}"]]:
         """Estimate progress and return bin logits for loss computation.
         
         Args:
             obs: Observation containing images and other inputs
+            stop_gradient_backbone: If True, stops gradient to backbone (VLM),
+                preventing progress_loss from updating backbone parameters
             
         Returns:
             progress: [batch] progress values in [0, 1]
             logits: [batch, num_bins] bin logits for cross-entropy loss
         """
         prefix_tokens, prefix_mask, _ = self.embed_prefix(obs)
+        
+        # Apply stop_gradient to prevent progress_loss from affecting backbone
+        if stop_gradient_backbone:
+            prefix_tokens = jax.lax.stop_gradient(prefix_tokens)
+            prefix_mask = jax.lax.stop_gradient(prefix_mask)
+        
         return self.progress_head(prefix_tokens, prefix_mask)

@@ -12,7 +12,7 @@ Usage:
     python examples/convert_jax_model_to_pytorch.py --checkpoint_dir /path/to/checkpoint --inspect_only
 
     # Convert to PyTorch:
-    python examples/convert_jax_model_to_pytorch.py --checkpoint_dir /path/to/checkpoint --output_path /path/to/output
+    python examples/convert_jax_model_to_pytorch.py --config-name pi05_teleavatar --checkpoint_dir checkpoints/pi05RL_pick_marker --output_path checkpoints/pi05RL_pick_marker_torch
     python examples/convert_jax_model_to_pytorch.py --checkpoint_dir /path/to/checkpoint --output_path /path/to/output
 
 Example:
@@ -438,31 +438,35 @@ def slice_progress_head_state_dict(state_dict):
         if key.startswith("mlp_blocks/"):
             block_keys.add(key.split("/")[1])
     
+    # Convert block names: "block_0" -> "0", "block_1" -> "1", etc.
     for block_name in sorted(block_keys):
+        # Extract block index from "block_X" format
+        block_idx = block_name.replace("block_", "")
+        
         if f"mlp_blocks/{block_name}/fc/kernel" in state_dict:
-            pytorch_state_dict[f"progress_head.mlp_blocks.{block_name}.fc.weight"] = torch.from_numpy(
+            pytorch_state_dict[f"progress_head.mlp_blocks.{block_idx}.fc.weight"] = torch.from_numpy(
                 np.array(state_dict.pop(f"mlp_blocks/{block_name}/fc/kernel")).T
             )
         if f"mlp_blocks/{block_name}/fc/bias" in state_dict:
-            pytorch_state_dict[f"progress_head.mlp_blocks.{block_name}.fc.bias"] = torch.from_numpy(
+            pytorch_state_dict[f"progress_head.mlp_blocks.{block_idx}.fc.bias"] = torch.from_numpy(
                 np.array(state_dict.pop(f"mlp_blocks/{block_name}/fc/bias"))
             )
         if f"mlp_blocks/{block_name}/norm/scale" in state_dict:
-            pytorch_state_dict[f"progress_head.mlp_blocks.{block_name}.norm.weight"] = torch.from_numpy(
+            pytorch_state_dict[f"progress_head.mlp_blocks.{block_idx}.norm.weight"] = torch.from_numpy(
                 np.array(state_dict.pop(f"mlp_blocks/{block_name}/norm/scale"))
             )
         if f"mlp_blocks/{block_name}/norm/bias" in state_dict:
-            pytorch_state_dict[f"progress_head.mlp_blocks.{block_name}.norm.bias"] = torch.from_numpy(
+            pytorch_state_dict[f"progress_head.mlp_blocks.{block_idx}.norm.bias"] = torch.from_numpy(
                 np.array(state_dict.pop(f"mlp_blocks/{block_name}/norm/bias"))
             )
     
-    # 5. Output projection
+    # 5. Output projection (2D for binary classification)
     if "output_proj/kernel" in state_dict:
-        pytorch_state_dict["progress_head.output_proj.weight"] = torch.from_numpy(
-            np.array(state_dict.pop("output_proj/kernel")).T
-        )
+        kernel = np.array(state_dict.pop("output_proj/kernel"))
+        pytorch_state_dict["progress_head.output_proj.weight"] = torch.from_numpy(kernel.T)
     if "output_proj/bias" in state_dict:
-        pytorch_state_dict["progress_head.output_proj.bias"] = torch.from_numpy(np.array(state_dict.pop("output_proj/bias")))
+        bias = np.array(state_dict.pop("output_proj/bias"))
+        pytorch_state_dict["progress_head.output_proj.bias"] = torch.from_numpy(bias)
     
     return pytorch_state_dict
 

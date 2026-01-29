@@ -1,5 +1,5 @@
 
-"""PyTorch implementation of progress estimation head with attention pooling and binning."""
+"""PyTorch implementation of progress estimation head with attention pooling and binary classification."""
 
 import torch
 import torch.nn as nn
@@ -87,23 +87,23 @@ class MLPBlock(nn.Module):
 
 
 class ProgressHead(nn.Module):
-    """Improved progress estimation head with binning and soft-argmax."""
+    """Binary classification head for task completion prediction."""
     
     def __init__(
         self, 
         input_dim: int, 
-        num_bins: int = 101, 
+        num_bins: int = 2, 
         hidden_dim: int = 512, 
         num_layers: int = 3,
-        pool_dim: int = 256
+        pool_dim: int = 2048
     ):
         """
         Args:
             input_dim: VLM feature dimension (2048 for PaliGemma)
-            num_bins: Number of progress bins (101 for 0%, 1%, ..., 100%)
+            num_bins: Number of classes (2 for binary: 0=incomplete, 1=complete)
             hidden_dim: Hidden layer dimension
             num_layers: Number of MLP blocks
-            pool_dim: Dimension after attention pooling (256 for compression)
+            pool_dim: Dimension after attention pooling
         """
         super().__init__()
         self.num_bins = num_bins
@@ -118,11 +118,8 @@ class ProgressHead(nn.Module):
         # 3. MLP blocks with residual connections
         self.mlp_blocks = nn.ModuleList([MLPBlock(hidden_dim) for _ in range(num_layers)])
         
-        # 4. Output projection to bins
+        # 4. Output projection to bins (2 classes for binary classification)
         self.output_proj = nn.Linear(hidden_dim, num_bins)
-        
-        # Bin centers for soft-argmax: [0.0, 0.01, 0.02, ..., 1.0]
-        self.register_buffer('bin_centers', torch.linspace(0.0, 1.0, num_bins))
     
     def forward(
         self, 
@@ -134,11 +131,11 @@ class ProgressHead(nn.Module):
             features: [batch, seq_len, input_dim] VLM features
             mask: [batch, seq_len] attention mask
         Returns:
-            progress: [batch] progress values in [0, 1]
-            logits: [batch, num_bins] bin logits (for computing loss)
+            progress: [batch] probability of task completion (class 1), rounded to 0 or 1
+            logits: [batch, num_bins] class logits (for computing loss)
         """
         # 1. Attention pooling
-        x = self.attention_pool(features, mask)  # [b, input_dim]
+        x = self.attention_pool(features, mask)  # [b, pool_dim]
         
         # 2. Input projection
         x = self.input_proj(x)  # [b, hidden_dim]
@@ -149,12 +146,13 @@ class ProgressHead(nn.Module):
         for block in self.mlp_blocks:
             x = block(x)  # [b, hidden_dim]
         
-        # 4. Bin logits
-        logits = self.output_proj(x)  # [b, num_bins]
+        # 4. Binary classification logits
+        logits = self.output_proj(x)  # [b, 2]
         
-        # 5. Soft-argmax: compute expected value (differentiable)
-        probs = F.softmax(logits, dim=-1)  # [b, num_bins]
-        progress = torch.sum(probs * self.bin_centers.unsqueeze(0), dim=-1)  # [b]
+        # 5. Return prediction: -1 (incomplete) or 1 (complete)
+        probs = F.softmax(logits, dim=-1)  # [b, 2]
+        progress = (probs[:, 1] > 0.5).float() * 2 - 1  # [b] -1 or 1
         
         return progress, logits
+
 

@@ -90,24 +90,24 @@ class MLPBlock(nnx.Module):
 
 @at.typecheck
 class ProgressHead(nnx.Module):
-    """Improved progress estimation head with binning and soft-argmax."""
+    """Binary classification head for task completion prediction."""
     
     def __init__(
         self, 
         input_dim: int, 
-        num_bins: int = 101, 
+        num_bins: int = 2, 
         hidden_dim: int = 512, 
         num_layers: int = 3,
-        pool_dim: int = 256,
+        pool_dim: int = 2048,
         rngs: nnx.Rngs = None
     ):
         """
         Args:
             input_dim: VLM feature dimension (2048 for PaliGemma)
-            num_bins: Number of progress bins (101 for 0%, 1%, ..., 100%)
+            num_bins: Number of classes (2 for binary: 0=incomplete, 1=complete)
             hidden_dim: Hidden layer dimension
             num_layers: Number of MLP blocks
-            pool_dim: Dimension after attention pooling (256 for compression)
+            pool_dim: Dimension after attention pooling
             rngs: Random number generator
         """
         self.num_bins = num_bins
@@ -126,12 +126,8 @@ class ProgressHead(nnx.Module):
             for i in range(num_layers)
         }
         
-        # 4. Output projection to bins
+        # 4. Output projection to bins (2 classes for binary classification)
         self.output_proj = nnx.Linear(hidden_dim, num_bins, rngs=rngs)
-        
-        # Bin centers for soft-argmax: [0.0, 0.01, 0.02, ..., 1.0]
-        # Wrap as Variable (non-trainable constant) to avoid tracing issues
-        self.bin_centers = nnx.Variable(jnp.linspace(0.0, 1.0, num_bins))
     
     def __call__(
         self, 
@@ -143,8 +139,8 @@ class ProgressHead(nnx.Module):
             features: [batch, seq_len, input_dim] VLM features
             mask: [batch, seq_len] attention mask
         Returns:
-            progress: [batch] progress values in [0, 1]
-            logits: [batch, num_bins] bin logits (for computing loss)
+            progress: [batch] probability of task completion (class 1)
+            logits: [batch, num_bins] class logits (for computing loss)
         """
         # 1. Attention pooling (compress to pool_dim)
         x = self.attention_pool(features, mask)  # [b, pool_dim]
@@ -159,12 +155,12 @@ class ProgressHead(nnx.Module):
         for key in sorted(self.mlp_blocks.keys()):
             x = self.mlp_blocks[key](x)  # [b, hidden_dim]
         
-        # 4. Bin logits
-        logits = self.output_proj(x)  # [b, num_bins]
+        # 4. Binary classification logits
+        logits = self.output_proj(x)  # [b, 2]
         
-        # 5. Soft-argmax: compute expected value (differentiable)
-        probs = nnx.softmax(logits, axis=-1)  # [b, num_bins]
-        progress = jnp.sum(probs * self.bin_centers.value[None, :], axis=-1)  # [b]
-        
+        # 5. Return probability of class 1 (task complete)
+        probs = nnx.softmax(logits, axis=-1)  # [b, 2]
+        progress = jnp.where(probs[:, 1] > 0.5, 1.0, -1.0)  # [b] probability of class 1, rounded -1 or 1
+
         return progress, logits
 

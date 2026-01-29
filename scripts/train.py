@@ -143,67 +143,88 @@ def train_step(
     model = nnx.merge(state.model_def, state.params)
     model.train()
 
+    # Define filters for parameter updates
+    # action_loss: updates backbone (PaliGemma + Action Expert), excludes progress_head
+    backbone_filter = nnx.All(nnx.Param, nnx.Not(nnx_utils.PathRegex(".*progress_head.*")))
+    # progress_loss: only updates progress_head
+    progress_head_filter = nnx.All(nnx.Param, nnx_utils.PathRegex(".*progress_head.*"))
+    
     @at.typecheck
-    def loss_fn(
-        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions
-    ):
-        # Always compute action loss
+    def action_loss_fn(model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions):
+        """Compute action loss - only updates backbone, not progress_head."""
         chunked_loss = model.compute_loss(rng, observation, actions, train=True)
         action_loss = jnp.mean(chunked_loss)
+        return action_loss
+    
+    @at.typecheck
+    def progress_loss_fn(model: _model.BaseModel, observation: _model.Observation, current_step: at.Array):
+        if observation.progress is None:
+            return jnp.array(0.0), {"progress_loss": jnp.array(0.0), "progress_weight": jnp.array(0.0)}
         
-        # Compute progress loss using KL divergence with Gaussian smoothed labels
-        progress_loss = jnp.array(0.0)
-        if hasattr(model, 'estimate_progress_with_logits') and observation.progress is not None:
-            # Get bin logits from progress head
-            _, logits = model.estimate_progress_with_logits(observation)  # [b, 101]
-            
-            # Convert progress to target bin indices
-            target_progress = jnp.squeeze(observation.progress) if observation.progress.ndim > 1 else observation.progress
-            target_bins = jnp.round(target_progress * 100).astype(jnp.int32)
-            target_bins = jnp.clip(target_bins, 0, 100)  # [b]
-            
-            # Create Gaussian smoothed target distribution
-            # Instead of hard one-hot, use soft labels with Gaussian smoothing
-            bin_indices = jnp.arange(101)  # [0, 1, 2, ..., 100]
-            sigma = 2.0  # Standard deviation for Gaussian (adjust for smoothness)
-            
-            # For each sample in batch, create Gaussian distribution centered at target_bin
-            # distances shape: [b, 101] - distance from each bin to target for each sample
-            distances = bin_indices[None, :] - target_bins[:, None]  # [b, 101]
-            
-            # Gaussian probabilities: P(i) = exp(-(i - target)^2 / 2σ^2)
-            gaussian_probs = jnp.exp(-(distances ** 2) / (2 * sigma ** 2))  # [b, 101]
-            
-            # Normalize to sum to 1 (proper probability distribution)
-            target_distribution = gaussian_probs / jnp.sum(gaussian_probs, axis=-1, keepdims=True)  # [b, 101]
-            
-            # KL divergence loss: KL(target || predicted)
-            # More memory-efficient: use log_softmax directly, avoid computing softmax separately
-            log_predicted = jax.nn.log_softmax(logits, axis=-1)  # [b, 101]
-            log_target = jnp.log(target_distribution + 1e-10)  # [b, 101]
-            
-            # KL(P || Q) = sum(P * (log(P) - log(Q)))
-            # Use stop_gradient on target to avoid unnecessary gradients
-            kl_div = jnp.sum(jax.lax.stop_gradient(target_distribution) * (log_target - log_predicted), axis=-1)  # [b]
-            progress_loss = jnp.mean(kl_div)
+        pred_progress, logits = model.estimate_progress_with_logits(observation, stop_gradient_backbone=True)
+        target_progress = observation.progress
         
-        # Total loss: balance action and progress (reduced weight to avoid OOM)
-        # Further reduce weight if OOM persists
-        total_loss = action_loss + 0.01 * progress_loss
+        # Binary cross-entropy loss with class weights
+        # Class 0 (incomplete): weight = 1.0
+        # Class 1 (complete): weight = higher to prevent overfitting to class 0
+        target_labels = (target_progress > 0.5).astype(jnp.int32)  # Convert to 0/1 labels
         
-        return total_loss, {
-            "action_loss": action_loss,
+        # Compute class weights based on class frequency
+        class_1_ratio = jnp.mean(target_labels.astype(jnp.float32))
+        class_0_ratio = 1.0 - class_1_ratio
+        # Weight inversely proportional to class frequency
+        weight_class_0 = 1.0
+        weight_class_1 = jnp.maximum(class_0_ratio / jnp.maximum(class_1_ratio, 1e-6), 5.0)  # Cap at 5x
+        
+        # Binary cross-entropy with weighted samples
+        log_probs = nnx.log_softmax(logits, axis=-1)
+        weights = jnp.where(target_labels == 1, weight_class_1, weight_class_0)
+        ce_loss = -jnp.sum(nnx.one_hot(target_labels, 2) * log_probs, axis=-1)  # [b]
+        weighted_ce_loss = ce_loss * weights  # [b]
+        
+        progress_loss = jnp.mean(weighted_ce_loss)
+
+        progress_weight = 0.1
+
+        weighted_loss = progress_loss * progress_weight
+        aux_info = {
             "progress_loss": progress_loss,
+            "progress_weight": progress_weight,
+            "class_1_ratio": class_1_ratio,
+            "weight_class_1": weight_class_1,
         }
+        return weighted_loss, aux_info
 
     train_rng = jax.random.fold_in(rng, state.step)
     observation, actions = batch
 
-    # Filter out frozen params.
-    diff_state = nnx.DiffState(0, config.trainable_filter)
-    (loss, aux_info), grads = nnx.value_and_grad(loss_fn, argnums=diff_state, has_aux=True)(
+    # Compute gradients separately for action_loss and progress_loss
+    # 1. Action loss: only updates backbone (excludes progress_head)
+    backbone_diff_state = nnx.DiffState(0, nnx.All(config.trainable_filter, backbone_filter))
+    action_loss, action_grads = nnx.value_and_grad(action_loss_fn, argnums=backbone_diff_state)(
         model, train_rng, observation, actions
     )
+    
+    # 2. Progress loss: only updates progress_head (backbone already stopped by stop_gradient)
+    progress_head_diff_state = nnx.DiffState(0, nnx.All(config.trainable_filter, progress_head_filter))
+    (weighted_progress_loss, progress_aux), progress_grads = nnx.value_and_grad(
+        progress_loss_fn, argnums=progress_head_diff_state, has_aux=True
+    )(model, observation, state.step)
+    
+    # Extract aux info
+    progress_loss_raw = progress_aux["progress_loss"]
+    progress_weight = progress_aux["progress_weight"]
+    class_1_ratio = progress_aux.get("class_1_ratio", jnp.array(0.0))
+    weight_class_1 = progress_aux.get("weight_class_1", jnp.array(1.0))
+    
+    # Merge gradients from both losses
+    # Since action_grads and progress_grads have non-overlapping structures,
+    # we need to merge them using State.update() rather than tree.map
+    grads = action_grads
+    grads.update(progress_grads)
+    
+    # Total loss for logging (not used for gradient computation)
+    loss = action_loss + weighted_progress_loss
 
     params = state.params.filter(config.trainable_filter)
     updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
@@ -233,11 +254,14 @@ def train_step(
     )
     info = {
         "loss": loss,
+        "action_loss": action_loss,
+        "progress_loss": progress_loss_raw,
+        "progress_weight": progress_weight,
+        "class_1_ratio": class_1_ratio,
+        "weight_class_1": weight_class_1,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
-    # Add auxiliary loss info if available
-    info.update(aux_info)
     return new_state, info
 
 
