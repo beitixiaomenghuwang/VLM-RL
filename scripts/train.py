@@ -162,27 +162,17 @@ def train_step(
             return jnp.array(0.0), {"progress_loss": jnp.array(0.0), "progress_weight": jnp.array(0.0)}
         
         pred_progress, logits = model.estimate_progress_with_logits(observation, stop_gradient_backbone=True)
-        target_progress = observation.progress
+        target_progress = observation.progress  # [b], continuous values in [0, 1]
         
-        # Binary cross-entropy loss with class weights
-        # Class 0 (incomplete): weight = 1.0
-        # Class 1 (complete): weight = higher to prevent overfitting to class 0
-        target_labels = (target_progress > 0.5).astype(jnp.int32)  # Convert to 0/1 labels
+        # Convert continuous progress to class labels (0-100%)
+        # target_progress is in [0, 1], convert to [0, 100] integer labels
+        target_labels = jnp.clip(jnp.round(target_progress * 100), 0, 100).astype(jnp.int32)  # [b]
         
-        # Compute class weights based on class frequency
-        class_1_ratio = jnp.mean(target_labels.astype(jnp.float32))
-        class_0_ratio = 1.0 - class_1_ratio
-        # Weight inversely proportional to class frequency
-        weight_class_0 = 1.0
-        weight_class_1 = jnp.maximum(class_0_ratio / jnp.maximum(class_1_ratio, 1e-6), 5.0)  # Cap at 5x
+        # Cross-entropy loss for 101-class classification
+        log_probs = nnx.log_softmax(logits, axis=-1)  # [b, 101]
+        ce_loss = -jnp.sum(nnx.one_hot(target_labels, 101) * log_probs, axis=-1)  # [b]
         
-        # Binary cross-entropy with weighted samples
-        log_probs = nnx.log_softmax(logits, axis=-1)
-        weights = jnp.where(target_labels == 1, weight_class_1, weight_class_0)
-        ce_loss = -jnp.sum(nnx.one_hot(target_labels, 2) * log_probs, axis=-1)  # [b]
-        weighted_ce_loss = ce_loss * weights  # [b]
-        
-        progress_loss = jnp.mean(weighted_ce_loss)
+        progress_loss = jnp.mean(ce_loss)
 
         progress_weight = 0.1
 
@@ -190,8 +180,6 @@ def train_step(
         aux_info = {
             "progress_loss": progress_loss,
             "progress_weight": progress_weight,
-            "class_1_ratio": class_1_ratio,
-            "weight_class_1": weight_class_1,
         }
         return weighted_loss, aux_info
 
@@ -214,8 +202,6 @@ def train_step(
     # Extract aux info
     progress_loss_raw = progress_aux["progress_loss"]
     progress_weight = progress_aux["progress_weight"]
-    class_1_ratio = progress_aux.get("class_1_ratio", jnp.array(0.0))
-    weight_class_1 = progress_aux.get("weight_class_1", jnp.array(1.0))
     
     # Merge gradients from both losses
     # Since action_grads and progress_grads have non-overlapping structures,
@@ -257,8 +243,6 @@ def train_step(
         "action_loss": action_loss,
         "progress_loss": progress_loss_raw,
         "progress_weight": progress_weight,
-        "class_1_ratio": class_1_ratio,
-        "weight_class_1": weight_class_1,
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
     }
