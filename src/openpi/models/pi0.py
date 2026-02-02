@@ -99,16 +99,29 @@ class Pi0(_model.BaseModel):
             self.action_time_mlp_out = nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs)
         self.action_out_proj = nnx.Linear(action_expert_config.width, config.action_dim, rngs=rngs)
 
-        # Progress estimation head with binary classification
-        from openpi.models import progress_head as _progress_head
-        self.progress_head = _progress_head.ProgressHead(
-            input_dim=paligemma_config.width,  # 2048 for PaliGemma
-            num_bins=2,  # Binary classification: 0=incomplete, 1=complete
-            hidden_dim=512,  # Match checkpoint configuration
-            num_layers=3,
-            pool_dim=2048,  # No dimension reduction in attention pooling
-            rngs=rngs,
-        )
+        # Progress estimation head
+        if config.continuous_progress:
+            # Continuous progress estimation with 101-class classification (0-100%)
+            from openpi.models import progress_head_continuous as _progress_head
+            self.progress_head = _progress_head.ProgressHead(
+                input_dim=paligemma_config.width,  # 2048 for PaliGemma
+                num_bins=101,  # Continuous classification: 0-100%
+                hidden_dim=512,  # Match checkpoint configuration
+                num_layers=3,
+                pool_dim=2048,  # No dimension reduction in attention pooling
+                rngs=rngs,
+            )
+        else:
+            # Binary classification: 0=incomplete, 1=complete
+            from openpi.models import progress_head as _progress_head
+            self.progress_head = _progress_head.ProgressHead(
+                input_dim=paligemma_config.width,  # 2048 for PaliGemma
+                num_bins=2,  # Binary classification
+                hidden_dim=512,  # Match checkpoint configuration
+                num_layers=3,
+                pool_dim=2048,  # No dimension reduction in attention pooling
+                rngs=rngs,
+            )
 
         # This attribute gets automatically set by model.train() and model.eval().
         self.deterministic = True

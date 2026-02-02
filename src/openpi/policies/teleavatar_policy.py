@@ -146,4 +146,10 @@ class TeleavatarOutputs(transforms.DataTransformFn):
         if "progress" in data:
             result["progress"] = data["progress"]
         
+        # Pass through chains and denoise_inds for offline training (return_chain_info=True)
+        if "chains" in data:
+            result["chains"] = data["chains"]
+        if "denoise_inds" in data:
+            result["denoise_inds"] = data["denoise_inds"]
+        
         return result

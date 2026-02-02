@@ -164,17 +164,24 @@ def train_step(
         pred_progress, logits = model.estimate_progress_with_logits(observation, stop_gradient_backbone=True)
         target_progress = observation.progress  # [b], continuous values in [0, 1]
         
-        # Convert continuous progress to class labels (0-100%)
-        # target_progress is in [0, 1], convert to [0, 100] integer labels
-        target_labels = jnp.clip(jnp.round(target_progress * 100), 0, 100).astype(jnp.int32)  # [b]
+        # Get number of classes from logits shape
+        num_classes = logits.shape[-1]
         
-        # Cross-entropy loss for 101-class classification
-        log_probs = nnx.log_softmax(logits, axis=-1)  # [b, 101]
-        ce_loss = -jnp.sum(nnx.one_hot(target_labels, 101) * log_probs, axis=-1)  # [b]
+        if num_classes == 2:
+            # Binary classification: 0=incomplete, 1=complete
+            target_labels = (target_progress > 0.5).astype(jnp.int32)  # Convert to 0/1 labels
+        else:
+            # Continuous classification (101 classes for 0-100%)
+            # target_progress is in [0, 1], convert to [0, 100] integer labels
+            target_labels = jnp.clip(jnp.round(target_progress * 100), 0, 100).astype(jnp.int32)  # [b]
+        
+        # Cross-entropy loss
+        log_probs = nnx.log_softmax(logits, axis=-1)  # [b, num_classes]
+        ce_loss = -jnp.sum(nnx.one_hot(target_labels, num_classes) * log_probs, axis=-1)  # [b]
         
         progress_loss = jnp.mean(ce_loss)
 
-        progress_weight = 0.1
+        progress_weight = 0.01
 
         weighted_loss = progress_loss * progress_weight
         aux_info = {

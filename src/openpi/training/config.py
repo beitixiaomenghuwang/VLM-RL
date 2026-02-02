@@ -879,7 +879,7 @@ _CONFIGS = [
             action_dim=32  # Teleavatar uses 16-dim actions
         ),
         data=LeRobotTeleavatarDataConfig(
-            repo_id="/home/caslx/Robotics/openpi/checkpoints/pi05_RL_putplates/assets/inference",  # Dataset with progress labels
+            repo_id="inference",  # Dataset with progress labels
             base_config=DataConfig(
                 prompt_from_task=True,  # Use task from dataset as prompt
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'

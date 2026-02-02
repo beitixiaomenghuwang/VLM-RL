@@ -109,10 +109,10 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # Progress estimation head with binary classification
+        # Progress estimation head with 101-class continuous classification (0-100%)
         self.progress_head = ProgressHead(
             input_dim=paligemma_config.width,  # 2048 for PaliGemma
-            num_bins=2,  # Binary classification: 0=incomplete, 1=complete
+            num_bins=101,  # Continuous classification: 0-100%
             hidden_dim=512,  # Match JAX checkpoint configuration
             num_layers=3,
             pool_dim=2048,  # No dimension reduction in attention pooling
@@ -383,8 +383,23 @@ class PI0Pytorch(nn.Module):
         return F.mse_loss(u_t, v_t, reduction="none")
 
     @torch.no_grad()
-    def sample_actions(self, device, observation, noise=None, num_steps=10) -> Tensor:
-        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)"""
+    def sample_actions(self, device, observation, noise=None, num_steps=10, return_chain_info=False) -> Tensor | dict:
+        """Do a full inference forward and compute the action (batch_size x num_steps x num_motors)
+        
+        Args:
+            device: Device to use
+            observation: Input observation
+            noise: Optional initial noise
+            num_steps: Number of denoising steps
+            return_chain_info: If True, return dict with chains and denoise_inds for offline training
+        
+        Returns:
+            If return_chain_info=False: actions tensor [batch, action_horizon, action_dim]
+            If return_chain_info=True: dict with keys:
+                - actions: final actions
+                - chains: all intermediate states [batch, num_steps+1, action_horizon, action_dim]
+                - denoise_inds: denoising step indices [batch, num_steps]
+        """
         bsize = observation.state.shape[0]
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
@@ -413,6 +428,11 @@ class PI0Pytorch(nn.Module):
 
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
+        
+        # Track chains if needed for offline training
+        chains = [x_t.clone()] if return_chain_info else None
+        step_idx = 0
+        
         while time >= -dt / 2:
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
@@ -426,6 +446,22 @@ class PI0Pytorch(nn.Module):
             # Euler step - use new tensor assignment instead of in-place operation
             x_t = x_t + dt * v_t
             time += dt
+            step_idx += 1
+            
+            if return_chain_info:
+                chains.append(x_t.clone())
+        
+        if return_chain_info:
+            # Stack chains: [batch, num_steps+1, action_horizon, action_dim]
+            chains_tensor = torch.stack(chains, dim=1)
+            # Create denoise_inds: [batch, num_steps] - 记录每一步的索引
+            denoise_inds = torch.arange(num_steps, device=device)[None, :].expand(bsize, -1)
+            return {
+                "actions": x_t,
+                "chains": chains_tensor,
+                "denoise_inds": denoise_inds,
+            }
+        
         return x_t
 
     def denoise_step(
@@ -472,7 +508,7 @@ class PI0Pytorch(nn.Module):
 
     @torch.no_grad()
     def estimate_progress(self, observation) -> torch.Tensor:
-        """Estimate task completion progress using binary classification.
+        """Estimate task completion progress using 101-class continuous classification.
         
         Uses attention pooling and multi-layer MLP for classification.
         
@@ -480,7 +516,7 @@ class PI0Pytorch(nn.Module):
             observation: Observation containing images and other inputs
             
         Returns:
-            Progress values (0 or 1) for each batch element [batch]
+            Progress values (0-1) for each batch element [batch]
         """
         images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
         
@@ -490,8 +526,8 @@ class PI0Pytorch(nn.Module):
         # Convert to float32 for progress head computation
         prefix_embs = prefix_embs.to(dtype=torch.float32)
         
-        # Use binary classification progress head
-        progress, _ = self.progress_head(prefix_embs, prefix_pad_masks)  # [b], rounded 0 or 1
+        # Use continuous classification progress head
+        progress, _ = self.progress_head(prefix_embs, prefix_pad_masks)  # [b], weighted average 0-1
         
         return progress
     
@@ -503,8 +539,8 @@ class PI0Pytorch(nn.Module):
             observation: Observation containing images and other inputs
             
         Returns:
-            progress: [batch] progress values (0 or 1), rounded
-            logits: [batch, 2] class logits for binary cross-entropy loss
+            progress: [batch] progress values (0-1), weighted average
+            logits: [batch, 101] class logits for cross-entropy loss
         """
         images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
         

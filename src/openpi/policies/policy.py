@@ -65,7 +65,17 @@ class Policy(BasePolicy):
             self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None, return_chain_info: bool = False) -> dict:  # type: ignore[misc]
+        """Run inference on the model.
+        
+        Args:
+            obs: Input observation dictionary
+            noise: Optional noise for action sampling
+            return_chain_info: If True, include chains and denoise_inds for offline training
+        
+        Returns:
+            Dictionary with actions and optionally chains/denoise_inds for offline training
+        """
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
@@ -86,12 +96,26 @@ class Policy(BasePolicy):
             if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
                 noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
             sample_kwargs["noise"] = noise
+        
+        # Add return_chain_info for PyTorch models
+        if self._is_pytorch_model and return_chain_info:
+            sample_kwargs["return_chain_info"] = True
 
         observation = _model.Observation.from_dict(inputs)
         start_time = time.monotonic()
         
         # Sample actions
-        actions = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        sample_result = self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs)
+        
+        # Handle dict return (when return_chain_info=True)
+        if isinstance(sample_result, dict):
+            actions = sample_result["actions"]
+            chains = sample_result.get("chains")
+            denoise_inds = sample_result.get("denoise_inds")
+        else:
+            actions = sample_result
+            chains = None
+            denoise_inds = None
         
         # Estimate progress if the model supports it
         progress = None
@@ -124,6 +148,11 @@ class Policy(BasePolicy):
         model_time = time.monotonic() - start_time
         if self._is_pytorch_model:
             outputs["actions"] = np.asarray(outputs["actions"][0, ...].detach().cpu())
+            # Add chain info for offline training
+            if chains is not None:
+                outputs["chains"] = chains[0, ...].detach().cpu()  # [num_steps+1, action_horizon, action_dim]
+            if denoise_inds is not None:
+                outputs["denoise_inds"] = denoise_inds[0, ...].detach().cpu()  # [num_steps]
         else:
             outputs["actions"] = np.asarray(outputs["actions"][0, ...])
 
