@@ -114,13 +114,16 @@ class Observation(Generic[ArrayT]):
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
         # Ensure that tokenized_prompt and tokenized_prompt_mask are provided together.
         if ("tokenized_prompt" in data) != ("tokenized_prompt_mask" in data):
-            raise ValueError("tokenized_prompt and tokenized_prompt_mask must be provided together.")
+            raise ValueError(
+                "tokenized_prompt and tokenized_prompt_mask must be provided together.")
         # If images are uint8, convert them to [-1, 1] float32.
         for key in data["image"]:
             if data["image"][key].dtype == np.uint8:
-                data["image"][key] = data["image"][key].astype(np.float32) / 255.0 * 2.0 - 1.0
+                data["image"][key] = data["image"][key].astype(
+                    np.float32) / 255.0 * 2.0 - 1.0
             elif hasattr(data["image"][key], "dtype") and data["image"][key].dtype == torch.uint8:
-                data["image"][key] = data["image"][key].to(torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
+                data["image"][key] = data["image"][key].to(
+                    torch.float32).permute(0, 3, 1, 2) / 255.0 * 2.0 - 1.0
         return cls(
             images=data["image"],
             image_masks=data["image_mask"],
@@ -158,7 +161,8 @@ def preprocess_observation(
     """
 
     if not set(image_keys).issubset(observation.images):
-        raise ValueError(f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
+        raise ValueError(
+            f"images dict missing keys: expected {image_keys}, got {list(observation.images)}")
 
     batch_shape = observation.state.shape[:-1]
 
@@ -166,7 +170,8 @@ def preprocess_observation(
     for key in image_keys:
         image = observation.images[key]
         if image.shape[1:3] != image_resolution:
-            logger.info(f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
+            logger.info(
+                f"Resizing image {key} from {image.shape[1:3]} to {image_resolution}")
             image = image_tools.resize_with_pad(image, *image_resolution)
 
         if train:
@@ -182,7 +187,8 @@ def preprocess_observation(
                     augmax.Rotate((-5, 5)),
                 ]
             transforms += [
-                augmax.ColorJitter(brightness=0.3, contrast=0.4, saturation=0.5),
+                augmax.ColorJitter(
+                    brightness=0.3, contrast=0.4, saturation=0.5),
             ]
             sub_rngs = jax.random.split(rng, image.shape[0])
             image = jax.vmap(augmax.Chain(*transforms))(sub_rngs, image)
@@ -239,30 +245,68 @@ class BaseModelConfig(abc.ABC):
         model = nnx.eval_shape(self.create, jax.random.key(0))
         graphdef, state = nnx.split(model)
         if remove_extra_params:
-            params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
-        
+            params = ocp.transform_utils.intersect_trees(
+                state.to_pure_dict(), params)
+
         # Handle missing bias parameters for progress_head (from use_bias=False in checkpoint)
         # NNX Linear layers create bias entries even with use_bias=False, but checkpoint may not have them
         state_dict = state.to_pure_dict()
         if 'progress_head' in state_dict and 'progress_head' in params:
-            flat_state = traverse_util.flatten_dict(state_dict['progress_head'])
+            flat_state = traverse_util.flatten_dict(
+                state_dict['progress_head'])
             flat_params = traverse_util.flatten_dict(params['progress_head'])
-            
+
             # Add None for missing bias parameters
             for key in flat_state.keys():
                 if key[-1] == 'bias' and key not in flat_params:
                     flat_params[key] = None
-            
+
             params['progress_head'] = traverse_util.unflatten_dict(flat_params)
-        
-        at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
+
+        at.check_pytree_equality(expected=state.to_pure_dict(
+        ), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
 
     def load_pytorch(self, train_config, weight_path: str):
+        """Load a PyTorch model from safetensors weights.
+
+        Args:
+            train_config: Training configuration
+            weight_path: Path to weight file. Can be:
+                - Path to single model.safetensors file
+                - Path to checkpoint directory containing sharded safetensors files
+        """
+        import os
+        import glob
+
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+
+        # Check if weight_path is a directory (sharded model) or a file
+        if os.path.isdir(weight_path):
+            # Sharded model: load from directory with multiple safetensors files
+            sharded_files = sorted(
+                glob.glob(os.path.join(weight_path, "model-*.safetensors")))
+            if sharded_files:
+                logger.info(
+                    f"Loading sharded PyTorch model from {len(sharded_files)} files")
+                # Load all shards and merge state dict
+                full_state_dict = {}
+                for shard_file in sharded_files:
+                    logger.info(
+                        f"Loading shard: {os.path.basename(shard_file)}")
+                    shard_dict = safetensors.torch.load_file(shard_file)
+                    full_state_dict.update(shard_dict)
+                # Load the merged state dict into the model
+                model.load_state_dict(full_state_dict, strict=False)
+            else:
+                raise FileNotFoundError(
+                    f"No sharded safetensors files found in {weight_path}")
+        else:
+            # Single file model
+            safetensors.torch.load_model(model, weight_path)
+
         return model
 
     @abc.abstractmethod
@@ -299,7 +343,8 @@ class BaseModel(nnx.Module, abc.ABC):
     ) -> at.Float[at.Array, "*b ah"]: ...
 
     @abc.abstractmethod
-    def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
+    def sample_actions(self, rng: at.KeyArrayLike,
+                       observation: Observation, **kwargs) -> Actions: ...
 
 
 def restore_params(
@@ -323,11 +368,13 @@ def restore_params(
     Returns:
         The restored params.
     """
-    params_path = pathlib.Path(params_path).resolve() if not str(params_path).startswith("gs://") else params_path
+    params_path = pathlib.Path(params_path).resolve() if not str(
+        params_path).startswith("gs://") else params_path
 
     if restore_type is jax.Array and sharding is None:
         mesh = jax.sharding.Mesh(jax.devices(), ("x",))
-        sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+        sharding = jax.sharding.NamedSharding(
+            mesh, jax.sharding.PartitionSpec())
 
     with ocp.PyTreeCheckpointer() as ckptr:
         metadata = ckptr.metadata(params_path)
@@ -338,7 +385,8 @@ def restore_params(
             ocp.args.PyTreeRestore(
                 item=item,
                 restore_args=jax.tree.map(
-                    lambda _: ocp.ArrayRestoreArgs(sharding=sharding, restore_type=restore_type, dtype=dtype), item
+                    lambda _: ocp.ArrayRestoreArgs(
+                        sharding=sharding, restore_type=restore_type, dtype=dtype), item
                 ),
             ),
         )["params"]
