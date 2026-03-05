@@ -31,6 +31,8 @@ class Pi0Config(_model.BaseModelConfig):
     pi05: bool = False
     # This config option is not used directly by the model, but it is read by the ModelTransformFactory.
     discrete_state_input: bool = None  # type: ignore
+    # Enable progress estimation head (set to False for old models without progress head)
+    enable_progress_head: bool = False
     # Use continuous progress head (101 classes) instead of binary (2 classes)
     continuous_progress: bool = True
 

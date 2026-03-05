@@ -9,7 +9,6 @@ import torch.nn.functional as F  # noqa: N812
 import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
-from openpi.models_pytorch.progress_head_pytorch import ProgressHead
 
 
 def get_safe_dtype(target_dtype, device_type):
@@ -109,14 +108,17 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_in = nn.Linear(2 * action_expert_config.width, action_expert_config.width)
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
-        # Progress estimation head with 101-class continuous classification (0-100%)
-        self.progress_head = ProgressHead(
-            input_dim=paligemma_config.width,  # 2048 for PaliGemma
-            num_bins=101,  # Continuous classification: 0-100%
-            hidden_dim=512,  # Match JAX checkpoint configuration
-            num_layers=3,
-            pool_dim=2048,  # No dimension reduction in attention pooling
-        )
+        # Progress estimation head (only create if enabled)
+        self.progress_head = None
+        if getattr(config, 'enable_progress_head', False):
+            from openpi.models_pytorch.progress_head_pytorch import ProgressHead
+            self.progress_head = ProgressHead(
+                input_dim=paligemma_config.width,  # 2048 for PaliGemma
+                num_bins=101,  # Continuous classification: 0-100%
+                hidden_dim=512,  # Match JAX checkpoint configuration
+                num_layers=3,
+                pool_dim=2048,  # No dimension reduction in attention pooling
+            )
 
         torch.set_float32_matmul_precision("high")
         self.sample_actions = torch.compile(self.sample_actions, mode="max-autotune")
@@ -507,7 +509,7 @@ class PI0Pytorch(nn.Module):
         return self.action_out_proj(suffix_out)
 
     @torch.no_grad()
-    def estimate_progress(self, observation) -> torch.Tensor:
+    def estimate_progress(self, observation) -> torch.Tensor | None:
         """Estimate task completion progress using 101-class continuous classification.
         
         Uses attention pooling and multi-layer MLP for classification.
@@ -516,8 +518,11 @@ class PI0Pytorch(nn.Module):
             observation: Observation containing images and other inputs
             
         Returns:
-            Progress values (0-1) for each batch element [batch]
+            Progress values (0-1) for each batch element [batch], or None if progress_head is disabled
         """
+        if self.progress_head is None:
+            return None
+            
         images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
         
         # Embed the prefix (images + language)
@@ -532,16 +537,20 @@ class PI0Pytorch(nn.Module):
         return progress
     
     @torch.no_grad()
-    def estimate_progress_with_logits(self, observation) -> tuple[torch.Tensor, torch.Tensor]:
+    def estimate_progress_with_logits(self, observation) -> tuple[torch.Tensor, torch.Tensor] | None:
         """Estimate progress and return class logits for loss computation.
         
         Args:
             observation: Observation containing images and other inputs
             
         Returns:
+            Tuple of (progress, logits) or None if progress_head is disabled
             progress: [batch] progress values (0-1), weighted average
             logits: [batch, 101] class logits for cross-entropy loss
         """
+        if self.progress_head is None:
+            return None
+            
         images, img_masks, lang_tokens, lang_masks, _ = self._preprocess_observation(observation, train=False)
         
         # Embed the prefix (images + language)

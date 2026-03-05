@@ -117,21 +117,23 @@ class Policy(BasePolicy):
             chains = None
             denoise_inds = None
         
-        # Estimate progress if the model supports it
+        # Estimate progress if the model supports it and has progress_head enabled
         progress = None
-        if hasattr(self._model, 'estimate_progress'):
+        if hasattr(self._model, 'estimate_progress') and hasattr(self._model, 'progress_head') and self._model.progress_head is not None:
             try:
                 if self._is_pytorch_model:
                     # PyTorch model
                     with torch.no_grad():
                         progress_tensor = self._model.estimate_progress(observation)
-                        progress = float(progress_tensor[0].detach().cpu().numpy())
+                        if progress_tensor is not None:
+                            progress = float(progress_tensor[0].detach().cpu().numpy())
                 else:
                     # JAX model - use the jitted function
                     if not hasattr(self, '_estimate_progress_fn'):
                         self._estimate_progress_fn = nnx_utils.module_jit(self._model.estimate_progress)
                     progress_array = self._estimate_progress_fn(observation)
-                    progress = float(progress_array[0])
+                    if progress_array is not None:
+                        progress = float(progress_array[0])
             except Exception as e:
                 logging.warning(f"Failed to estimate progress: {e}", exc_info=True)
                 progress = None
