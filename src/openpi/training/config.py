@@ -937,7 +937,7 @@ _CONFIGS = [
                 prompt_from_task=True,  # Use task from dataset as prompt
                 action_sequence_keys=("action",)  # Use 'action' not 'actions'
             ),
-            use_delta_joint_actions=False,
+            use_delta_ee_actions=False,
         ),
         batch_size=64,
         num_workers=32,
